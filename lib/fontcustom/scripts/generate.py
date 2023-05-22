@@ -1,132 +1,126 @@
 import fontforge
 import os
+import hashlib
 import subprocess
 import tempfile
 import json
 
-#
-# Manifest / Options
-# Older Pythons don't have argparse, so we use optparse instead
-#
-
 try:
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('manifest', help='Path to .fontcustom-manifest.json')
-    args = parser.parse_args()
-    manifestfile = open(args.manifest, 'r+')
+	import argparse
+	parser = argparse.ArgumentParser(description='Convert a directory of svg and eps files into a unified font file.')
+	parser.add_argument('dir', metavar='directory', nargs=2, help='directory of vector files')
+	parser.add_argument('--name', metavar='fontname', nargs='?', default='fontcustom', help='reference name of the font (no spaces)')
+	parser.add_argument('--nohash', '-n', action='store_true', help='disable hash fingerprinting of font files')
+	parser.add_argument('--debug', '-d', action='store_true', help='display debug messages')
+	args = parser.parse_args()
+	indir = args.dir[0]
+	outdir = args.dir[1]
 except ImportError:
-    import optparse
-    parser = optparse.OptionParser()
-    (nothing, args) = parser.parse_args()
-    manifestfile = open(args[0], 'r+')
+	# Older Pythons don't have argparse, so we use optparse instead
+	import optparse
+	parser = optparse.OptionParser(description='Convert a directory of svg and eps files into a unified font file.')
+	parser.add_option('--name', metavar='fontname', type='string', nargs='?', default='fontcustom', help='reference name of the font (no spaces)')
+	parser.add_option('--nohash', '-n', action='store_true', help='disable hash fingerprinting of font files')
+	parser.add_argument('--debug', '-d', action='store_true', help='display debug messages')
+	(args, posargs) = parser.parse_args()
+	indir = posargs[0]
+	outdir = posargs[1]
 
-manifest = json.load(manifestfile)
-options = manifest['options']
+f = fontforge.font()
+f.encoding = 'UnicodeFull'
+f.design_size = 16
+f.em = 512
+f.ascent = 448
+f.descent = 64
 
-#
-# Font
-#
+m = hashlib.new('md5')
+cp = 0xf100
+files = []
 
-design_px = options['font_em'] / options['font_design_size']
+KERNING = 15
 
-font = fontforge.font()
-font.encoding = 'UnicodeFull'
-font.design_size = options['font_design_size']
-font.em = options['font_em']
-font.ascent = options['font_ascent']
-font.descent = options['font_descent']
-font.fontname = options['font_name']
-font.familyname = options['font_name']
-font.fullname = options['font_name']
-if options['autowidth']:
-    font.autoWidth(0, 0, options['font_em'])
+for dirname, dirnames, filenames in os.walk(indir):
+	for filename in filenames:
+		name, ext = os.path.splitext(filename)
+		filePath = os.path.join(dirname, filename)
+		size = os.path.getsize(filePath)
 
-#
-# Glyphs
-#
+		if ext in ['.svg', '.eps']:
+			if ext in ['.svg']:
+				# hack removal of <switch> </switch> tags
+				svgfile = open(filePath, 'r+')
+				tmpsvgfile = tempfile.NamedTemporaryFile(suffix=ext, mode='w+t', delete=False)
+				svgtext = svgfile.read()
+				svgfile.seek(0)
 
-def removeSwitchFromSvg( file ):
-    svgfile = open(file, 'r')
-    svgtext = svgfile.read()
-    svgfile.close()
-    tmpsvgfile = tempfile.NamedTemporaryFile(suffix=".svg", delete=False)
-    svgtext = svgtext.replace('<switch>', '')
-    svgtext = svgtext.replace('</switch>', '')
-    tmpsvgfile.file.write(svgtext)
-    tmpsvgfile.file.close()
+				# replace the <switch> </switch> tags with 'nothing'
+				svgtext = svgtext.replace('<switch>', '')
+				svgtext = svgtext.replace('</switch>', '')
+			
+				tmpsvgfile.file.write(svgtext)
 
-    return tmpsvgfile.name
+				svgfile.close()
+				tmpsvgfile.file.close()
 
-def createGlyph( name, source, code ):
-    frag, ext = os.path.splitext(source)
+				filePath = tmpsvgfile.name
+				# end hack
+				
+			# m.update(filename + str(size) + ';')
+			glyph = f.createChar(cp)
+			glyph.importOutlines(filePath)
 
-    if ext == '.svg':
-        temp = removeSwitchFromSvg(source)
-        glyph = font.createChar(code)
-        glyph.importOutlines(temp)
-        os.unlink(temp)
+			# if we created a temporary file, let's clean it up
+			if tmpsvgfile:
+				os.unlink(tmpsvgfile.name)
 
-        if options['autowidth']:
-            glyph.left_side_bearing = glyph.right_side_bearing = 0
-            glyph.round()
-        else:
-            glyph.width = options['font_em']
-            width = glyph.width - glyph.left_side_bearing - glyph.right_side_bearing
-            aligned_to_pixel_grid = (width % design_px == 0)
-            if (aligned_to_pixel_grid):
-                shift = glyph.left_side_bearing % design_px
-                glyph.left_side_bearing = glyph.left_side_bearing - shift
-                glyph.right_side_bearing = glyph.right_side_bearing + shift
+			# glyph.left_side_bearing = KERNING
+			# glyph.right_side_bearing = KERNING
+			glyph.width = 512
 
-# Add valid space glyph to avoid "unknown character" box on IE11
-glyph = font.createChar(32)
-glyph.width = 200
+			# possible optimization?
+			# glyph.simplify()
+			# glyph.round()
 
-for glyph, data in manifest['glyphs'].iteritems():
-    name = createGlyph(glyph, data['source'], data['codepoint'])
+			files.append(name)
+			cp += 1
 
-#
-# Generate Files
-#
+if args.nohash:
+	fontfile = outdir + '/' + args.name
+else:
+	hashStr = m.hexdigest()
+	fontfile = outdir + '/' + args.name + '_' + hashStr
 
+f.fontname = args.name
+f.familyname = args.name
+f.fullname = args.name
+f.generate(fontfile + '.ttf')
+f.generate(fontfile + '.svg')
+
+# Fix SVG header for webkit
+# from: https://github.com/fontello/font-builder/blob/master/bin/fontconvert.py
+svgfile = open(fontfile + '.svg', 'r+')
+svgtext = svgfile.read()
+svgfile.seek(0)
+svgfile.write(svgtext.replace('''<svg>''', '''<svg xmlns="http://www.w3.org/2000/svg">'''))
+svgfile.close()
+
+scriptPath = os.path.dirname(os.path.realpath(__file__))
 try:
-    fontfile = options['output']['fonts'] + '/' + options['font_name']
-    if not options['no_hash']:
-        fontfile += '_' + manifest['checksum']['current'][:32]
+	subprocess.Popen([scriptPath + '/sfnt2woff-zopfli', fontfile + '.ttf'], stdout=subprocess.PIPE)
+except OSError:
+	# If the local version of sfnt2woff fails (i.e., on Linux), try to use the
+	# global version. This allows us to avoid forcing OS X users to compile
+	# sfnt2woff from source, simplifying install.
+	subprocess.call(['sfnt2woff-zopfli', fontfile + '.ttf'])
 
-    # Generate TTF and SVG
-    font.generate(fontfile + '.ttf')
-    font.generate(fontfile + '.svg')
-    manifest['fonts'].append(fontfile + '.ttf')
-    manifest['fonts'].append(fontfile + '.svg')
+# eotlitetool.py script to generate IE7-compatible .eot fonts
+# Seems to have an error, may need to use EOT utils https://www.w3.org/Tools/eot-utils/
+subprocess.call('python ' + scriptPath + '/eotlitetool.py ' + fontfile + '.ttf -o ' + fontfile + '.eot', shell=True)
+subprocess.call('mv ' + fontfile + '.eotlite ' + fontfile + '.eot', shell=True)
 
-    # Fix SVG header for webkit
-    # from: https://github.com/fontello/font-builder/blob/master/bin/fontconvert.py
-    svgfile = open(fontfile + '.svg', 'r+')
-    svgtext = svgfile.read()
-    svgfile.seek(0)
-    svgfile.write(svgtext.replace('''<svg>''', '''<svg xmlns="http://www.w3.org/2000/svg">'''))
-    svgfile.close()
+# Hint the TTF file
+subprocess.call('ttfautohint -s -n ' + fontfile + '.ttf ' + fontfile + '-hinted.ttf > /dev/null 2>&1 && mv ' + fontfile + '-hinted.ttf ' + fontfile + '.ttf', shell=True)
 
-    # Convert WOFF
-    scriptPath = os.path.dirname(os.path.realpath(__file__))
-    try:
-        subprocess.Popen([scriptPath + '/sfnt2woff', fontfile + '.ttf'], stdout=subprocess.PIPE)
-    except OSError:
-        # If the local version of sfnt2woff fails (i.e., on Linux), try to use the
-        # global version. This allows us to avoid forcing OS X users to compile
-        # sfnt2woff from source, simplifying install.
-        subprocess.call(['sfnt2woff', fontfile + '.ttf'])
-    manifest['fonts'].append(fontfile + '.woff')
-
-    # Convert EOT for IE7
-    subprocess.call('python ' + scriptPath + '/eotlitetool.py ' + fontfile + '.ttf -o ' + fontfile + '.eot', shell=True)
-    subprocess.call('mv ' + fontfile + '.eotlite ' + fontfile + '.eot', shell=True)
-    manifest['fonts'].append(fontfile + '.eot')
-
-finally:
-    manifestfile.seek(0)
-    manifestfile.write(json.dumps(manifest, indent=2, sort_keys=True))
-    manifestfile.truncate()
-    manifestfile.close()
+# Describe output in JSON
+outname = os.path.basename(fontfile)
+print(json.dumps({'fonts': [outname + '.ttf', outname + '.woff', outname + '.eot', outname + '.svg'], 'glyphs': files, 'file_name': outname}))
